@@ -1319,7 +1319,8 @@ async def on_error(update, context):
 
 
 def main():
-    start_web()
+    import web
+    web.start(globals())
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
