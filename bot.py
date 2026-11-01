@@ -33,6 +33,7 @@ BLOCK_SECONDS = 300
 PAGE_SIZE = 5
 ALBUM_SIZE = 10
 PASS_TTL = 60
+MAX_SEND = 100
 
 fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
@@ -192,10 +193,10 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, file_id TEXT,
         content TEXT, caption TEXT, folder_id INTEGER, fav INTEGER DEFAULT 0,
         created TEXT, deleted INTEGER DEFAULT 0, deleted_at TEXT,
-        place_id INTEGER, fuid TEXT, fname TEXT)""")
+        place_id INTEGER, fuid TEXT, fname TEXT, thumb TEXT)""")
     cols = [r["name"] for r in run("PRAGMA table_info(items)")]
     for col, ddl in (("deleted", "INTEGER DEFAULT 0"), ("deleted_at", "TEXT"),
-                     ("place_id", "INTEGER"), ("fuid", "TEXT"), ("fname", "TEXT")):
+                     ("place_id", "INTEGER"), ("fuid", "TEXT"), ("fname", "TEXT"), ("thumb", "TEXT")):
         if col not in cols:
             run(f"ALTER TABLE items ADD COLUMN {col} {ddl}")
     run("CREATE TABLE IF NOT EXISTS folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
@@ -216,10 +217,11 @@ def init_db():
     BLOCKED.update(r["user_id"] for r in run("SELECT user_id FROM users WHERE blocked=1"))
     dirty = False
 
-def save(kind, file_id=None, content=None, caption=None, folder=None, fuid=None, fname=None, place=None):
-    run("INSERT INTO items(kind,file_id,content,caption,folder_id,created,fuid,fname,place_id) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
-        (kind, file_id, content, caption, folder, now(), fuid, fname, place))
+def save(kind, file_id=None, content=None, caption=None, folder=None, fuid=None, fname=None,
+         place=None, thumb=None):
+    run("INSERT INTO items(kind,file_id,content,caption,folder_id,created,fuid,fname,place_id,thumb) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (kind, file_id, content, caption, folder, now(), fuid, fname, place, thumb))
 
 def where_for(key):
     if key == "trash":
@@ -230,8 +232,6 @@ def where_for(key):
         return "deleted=0 AND kind=?", (key,)
     if key == "fav":
         return "deleted=0 AND fav=1 AND kind!='pass'", ()
-    if key.startswith("m") and re.fullmatch(r"\d{4}-\d{2}", key[1:]):
-        return "deleted=0 AND kind!='pass' AND created LIKE ?", (key[1:] + "%",)
     return "deleted=0 AND folder_id=? AND kind!='pass'", (int(key[1:]),)
 
 def fetch(key, page, size=PAGE_SIZE):
@@ -373,7 +373,7 @@ async def background(app):
             if time.time() - last_purge >= 3600:
                 last_purge = time.time()
                 cutoff = (now_dt() - timedelta(days=TRASH_DAYS)).strftime("%Y-%m-%d %H:%M")
-                run("DELETE FROM items WHERE deleted=1 AND deleted_at<?", (cutoff,))
+                run("DELETE FROM items WHERE deleted=1 AND deleted_at<?", (cutoff,), mark=False)
         except Exception:
             log.exception("Fon vazifasida xato")
 
@@ -419,10 +419,9 @@ def kb_main(uid):
         [Btn(t(uid, "b_contacts", n=g("contact")), callback_data="list:contact:0"),
          Btn(t(uid, "b_favs"), callback_data="list:fav:0")],
         [Btn(t(uid, "b_folders"), callback_data="folders"), Btn(t(uid, "b_search"), callback_data="search")],
-        [Btn(t(uid, "b_remind"), callback_data="rem"), Btn(t(uid, "b_months"), callback_data="months")],
+        [Btn(t(uid, "b_remind"), callback_data="rem"), Btn(t(uid, "b_stats"), callback_data="stats")],
         [Btn(t(uid, "b_vault"), callback_data="vault"),
          Btn(t(uid, "b_trash", n=trash_count()), callback_data="list:trash:0")],
-        [Btn(t(uid, "b_stats"), callback_data="stats"), Btn(t(uid, "b_export"), callback_data="export")],
         [Btn(t(uid, "b_backup"), callback_data="backup"), Btn(t(uid, "b_logout"), callback_data="logout")],
     ]
     if is_owner(uid):
@@ -464,27 +463,63 @@ def item_kb(uid, it, fav_view=False):
     else:
         rows.append([Btn(t(uid, "b_edit"), callback_data=f"edit:{i}"),
                      Btn(t(uid, "b_move"), callback_data=f"mv:{i}")])
+    if it["kind"] in ("photo", "video") and can_send(uid):
+        rows.append([Btn(t(uid, "b_send"), callback_data=f"ss~i{i}")])
     return Markup(rows)
 
 def back_target(key):
     if key == "pass":
         return "vault"
-    if key[:1] == "m" and key[1:2].isdigit():
-        return "months"
     if key[:1] == "d" and key[1:].isdigit():
         return "folders"
     return "menu"
 
-def media_count(fid):
-    return run("SELECT COUNT(*) c FROM items WHERE folder_id=? AND deleted=0 AND kind IN ('photo','video')",
-               (fid,))[0]["c"]
+def send_rows(scope):
+    """Yuboriladigan rasm/videolar. scope: i<id> bitta, f<papka>, k<kalit>.<sahifa>, m<kalit>.<sahifa> (albom), a<kalit> hammasi."""
+    kinds = "kind IN ('photo','video')"
+    kind, arg = scope[0], scope[1:]
+    if kind == "i":
+        rows = run(f"SELECT * FROM items WHERE id=? AND deleted=0 AND {kinds}", (int(arg),))
+        return list(rows), len(rows)
+    if kind in ("k", "m"):
+        key, _, page = arg.rpartition(".")
+        rows = fetch(key, int(page), PAGE_SIZE if kind == "k" else ALBUM_SIZE)[0]
+        rows = [r for r in rows if r["kind"] in ("photo", "video")]
+        return list(reversed(rows)), len(rows)
+    if kind == "f":
+        where, args = "deleted=0 AND folder_id=?", (int(arg),)
+    else:
+        w, args = where_for(arg)
+        where = "(" + w + ")"
+    total = run(f"SELECT COUNT(*) c FROM items WHERE {where} AND {kinds}", args)[0]["c"]
+    rows = run(f"SELECT * FROM items WHERE {where} AND {kinds} ORDER BY id DESC LIMIT ?",
+               args + (MAX_SEND,))
+    return list(reversed(rows)), total
 
-def send_confirm_view(uid, fid, tid):
+def send_who_view(uid, scope):
+    kb = []
+    for r in run("SELECT user_id, name, username FROM users WHERE user_id!=? AND blocked=0 "
+                 "ORDER BY last_seen DESC LIMIT 20", (uid,)):
+        kb.append([Btn(f"👤 {r['name']} · @{r['username'] or '-'}",
+                       callback_data=f"st~{scope}~{r['user_id']}~1")])
+    kb.append([Btn(t(uid, "b_send_id"), callback_data=f"si~{scope}")])
+    kb.append([Btn(t(uid, "b_back"), callback_data="delno")])
+    return t(uid, "send_who"), Markup(kb)
+
+def send_confirm_view(uid, scope, tid, prot=1):
+    rows, total = send_rows(scope)
     r = run("SELECT name FROM users WHERE user_id=?", (tid,))
     who = r[0]["name"] if r else str(tid)
-    kb = Markup([[Btn(t(uid, "send_go"), callback_data=f"fgo:{fid}:{tid}"),
-                  Btn(t(uid, "b_no"), callback_data="delno")]])
-    return t(uid, "send_confirm", n=media_count(fid), who=who), kb
+    text = t(uid, "send_confirm", n=len(rows), who=who,
+             prot=t(uid, "send_prot_on" if prot else "send_prot_off"))
+    if total > len(rows):
+        text += t(uid, "send_limit", n=len(rows))
+    kb = Markup([
+        [Btn(t(uid, "send_go"), callback_data=f"sg~{scope}~{tid}~{prot}")],
+        [Btn(t(uid, "b_allow" if prot else "b_deny"), callback_data=f"st~{scope}~{tid}~{1 - prot}")],
+        [Btn(t(uid, "b_no"), callback_data="delno")],
+    ])
+    return text, kb
 
 async def show(update, text, kb=None):
     q = update.callback_query
@@ -511,17 +546,17 @@ async def send_menu(update, context):
 
 
 # ---------- Elementlarni ko'rsatish ----------
-async def send_media(bot, chat_id, rows):
+async def send_media(bot, chat_id, rows, protect=True):
     media = [InputMediaPhoto(r["file_id"]) if r["kind"] == "photo" else InputMediaVideo(r["file_id"])
              for r in rows]
     if len(media) == 1:
         r = rows[0]
         if r["kind"] == "photo":
-            await bot.send_photo(chat_id=chat_id, photo=r["file_id"], protect_content=True)
+            await bot.send_photo(chat_id=chat_id, photo=r["file_id"], protect_content=protect)
         else:
-            await bot.send_video(chat_id=chat_id, video=r["file_id"], protect_content=True)
+            await bot.send_video(chat_id=chat_id, video=r["file_id"], protect_content=protect)
     elif media:
-        await bot.send_media_group(chat_id=chat_id, media=media, protect_content=True)
+        await bot.send_media_group(chat_id=chat_id, media=media, protect_content=protect)
 
 async def send_item(bot, chat_id, uid, it, fav_view=False):
     kb, k = item_kb(uid, it, fav_view), it["kind"]
@@ -570,6 +605,9 @@ async def show_list(update, context, key, page):
     kb = [nav] if nav else []
     if key == "photo":
         kb.append([Btn(t(uid, "b_album"), callback_data="alb:photo:0")])
+    if can_send(uid) and (key in ("photo", "video", "fav") or (key[:1] == "d" and key[1:].isdigit())):
+        kb.append([Btn(t(uid, "b_send_page"), callback_data=f"ss~k{key}.{page}"),
+                   Btn(t(uid, "b_send_all"), callback_data=f"ss~a{key}")])
     kb.append([Btn(t(uid, "b_back"), callback_data=back)])
     a = page * PAGE_SIZE + 1
     await q.message.reply_text(t(uid, "page", a=a, b=a + len(rows) - 1, c=total),
@@ -590,6 +628,9 @@ async def show_album(update, context, key, page):
         nav.append(Btn(t(uid, "next"), callback_data=f"alb:{key}:{page + 1}"))
     kb = [nav] if nav else []
     kb.append([Btn(t(uid, "b_single"), callback_data=f"list:{key}:0")])
+    if can_send(uid):
+        kb.append([Btn(t(uid, "b_send_page"), callback_data=f"ss~m{key}.{page}"),
+                   Btn(t(uid, "b_send_all"), callback_data=f"ss~a{key}")])
     kb.append([Btn(t(uid, "b_back"), callback_data="menu")])
     a = page * ALBUM_SIZE + 1
     await q.message.reply_text(t(uid, "page", a=a, b=a + len(rows) - 1, c=total),
@@ -767,11 +808,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not can_send(uid):
                 return
             raw = text.strip()
-            if not raw.isdigit():
+            scope = ud.get("send_scope")
+            if not raw.isdigit() or not scope:
                 ud["state"] = "send_id"
                 await msg.reply_text(t(uid, "send_id_bad"))
                 return
-            txt, kb = send_confirm_view(uid, ud.get("send_fid"), int(raw))
+            txt, kb = send_confirm_view(uid, scope, int(raw), 1)
             await msg.reply_text(txt, reply_markup=kb)
         elif state == "rem_text":
             ud["rem_text"] = text[:500]
@@ -856,11 +898,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 5) Oddiy saqlash (bitta yoki ko'p fayl)
     place = ud.get("place_id")
-    k = fid = fuid = fname = None
+    k = fid = fuid = fname = thumb = None
     if msg.photo:
         k, fid, fuid = "photo", msg.photo[-1].file_id, msg.photo[-1].file_unique_id
+        thumb = (msg.photo[1] if len(msg.photo) > 1 else msg.photo[0]).file_id
     elif msg.video:
         k, fid, fuid, fname = "video", msg.video.file_id, msg.video.file_unique_id, msg.video.file_name
+        tn = getattr(msg.video, "thumbnail", None)
+        thumb = tn.file_id if tn else None
     elif msg.document:
         k, fid, fuid, fname = "doc", msg.document.file_id, msg.document.file_unique_id, msg.document.file_name
     elif msg.voice:
@@ -887,7 +932,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             outcome = "dup"
     else:
-        save(k, file_id=fid, caption=msg.caption, folder=folder, fuid=fuid, fname=fname, place=place)
+        save(k, file_id=fid, caption=msg.caption, folder=folder, fuid=fuid, fname=fname, place=place,
+             thumb=thumb)
         outcome = "new"
         try:
             await context.bot.copy_message(CHANNEL_ID, msg.chat_id, msg.message_id)
@@ -1013,7 +1059,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ud["folder"] = fid
         kb = [[Btn(t(uid, "f_view"), callback_data=f"list:d{fid}:0")]]
         if can_send(uid):
-            kb.append([Btn(t(uid, "b_send"), callback_data=f"fsend:{fid}")])
+            kb.append([Btn(t(uid, "b_send"), callback_data=f"ss~f{fid}")])
         kb.append([Btn(t(uid, "f_del"), callback_data=f"dfdel:{fid}")])
         kb.append([Btn(t(uid, "b_back"), callback_data="folders")])
         await show(update, t(uid, "f_sel", name=r[0]["name"]), Markup(kb))
@@ -1034,43 +1080,37 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ud["state"] = "new_folder"
         await show(update, t(uid, "f_ask"), back_kb(uid, "folders"))
 
-    elif data.startswith("fsend:"):
-        fid = int(data[6:])
+    elif data.startswith("ss~"):
+        scope = data[3:]
         if not can_send(uid):
-            await show(update, t(uid, "send_denied"), back_kb(uid))
+            await q.message.reply_text(t(uid, "send_denied"))
             return
-        if media_count(fid) == 0:
-            await show(update, t(uid, "send_none"), back_kb(uid, f"dopen:{fid}"))
+        rows, _ = send_rows(scope)
+        if not rows:
+            await q.message.reply_text(t(uid, "send_none"))
             return
-        kb = []
-        for r in run("SELECT user_id, name, username FROM users WHERE user_id!=? AND blocked=0 "
-                     "ORDER BY last_seen DESC LIMIT 20", (uid,)):
-            kb.append([Btn(f"👤 {r['name']} · @{r['username'] or '-'}",
-                           callback_data=f"fto:{fid}:{r['user_id']}")])
-        kb.append([Btn(t(uid, "b_send_id"), callback_data=f"fid:{fid}")])
-        kb.append([Btn(t(uid, "b_back"), callback_data=f"dopen:{fid}")])
-        await show(update, t(uid, "send_who"), Markup(kb))
+        txt, kb = send_who_view(uid, scope)
+        await q.message.reply_text(txt, reply_markup=kb)
 
-    elif data.startswith("fid:"):
-        ud["send_fid"] = int(data[4:])
+    elif data.startswith("si~"):
+        ud["send_scope"] = data[3:]
         ud["state"] = "send_id"
-        await show(update, t(uid, "send_id_ask"), back_kb(uid, f"fsend:{data[4:]}"))
+        await show(update, t(uid, "send_id_ask"), Markup([[Btn(t(uid, "b_back"), callback_data="delno")]]))
 
-    elif data.startswith("fto:"):
-        _, fid, tid = data.split(":")
-        txt, kb = send_confirm_view(uid, int(fid), int(tid))
+    elif data.startswith("st~"):
+        _, scope, tid, prot = data.split("~")
+        txt, kb = send_confirm_view(uid, scope, int(tid), int(prot))
         await show(update, txt, kb)
 
-    elif data.startswith("fgo:"):
-        _, fid, tid = data.split(":")
-        fid, tid = int(fid), int(tid)
+    elif data.startswith("sg~"):
+        _, scope, tid, prot = data.split("~")
+        tid, protect = int(tid), prot == "1"
         if not can_send(uid):
-            await show(update, t(uid, "send_denied"), back_kb(uid))
+            await show(update, t(uid, "send_denied"), menu_kb(uid))
             return
-        rows = run("SELECT * FROM items WHERE folder_id=? AND deleted=0 AND kind IN ('photo','video') "
-                   "ORDER BY id", (fid,))
+        rows, _ = send_rows(scope)
         if not rows:
-            await show(update, t(uid, "send_none"), back_kb(uid, f"dopen:{fid}"))
+            await show(update, t(uid, "send_none"), menu_kb(uid))
             return
         sender = q.from_user.first_name or "?"
         sent = 0
@@ -1078,15 +1118,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(tid, t(tid, "send_header", name=sender, n=len(rows)))
             for i in range(0, len(rows), ALBUM_SIZE):
                 chunk = rows[i:i + ALBUM_SIZE]
-                await send_media(context.bot, tid, chunk)
+                await send_media(context.bot, tid, chunk, protect)
                 sent += len(chunk)
                 await asyncio.sleep(1.5)
         except Exception:
-            log.exception("Papkani yuborishda xato")
+            log.exception("Yuborishda xato")
             extra = f"\n({sent}/{len(rows)})" if sent else ""
-            await show(update, t(uid, "send_fail") + extra, back_kb(uid, f"dopen:{fid}"))
+            await show(update, t(uid, "send_fail") + extra, menu_kb(uid))
             return
-        await show(update, t(uid, "send_done", n=sent), back_kb(uid, f"dopen:{fid}"))
+        await show(update, t(uid, "send_done", n=sent), menu_kb(uid))
 
     elif data.startswith("plc:"):
         parts = data.split(":")
@@ -1135,18 +1175,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         run("UPDATE items SET place_id=NULL WHERE place_id=?", (pid,))
         run("DELETE FROM places WHERE id=?", (pid,))
         await show(update, t(uid, "plc_deleted"), back_kb(uid, "plc:list:0"))
-
-    elif data == "months":
-        rows = run("SELECT substr(created,1,7) m, COUNT(*) c FROM items "
-                   "WHERE deleted=0 AND kind!='pass' GROUP BY m ORDER BY m DESC LIMIT 36")
-        rows = [r for r in rows if r["m"]]
-        if not rows:
-            await show(update, t(uid, "months_none"), back_kb(uid))
-            return
-        btns = [Btn(f"{r['m']} ({r['c']})", callback_data=f"list:m{r['m']}:0") for r in rows]
-        kb = [btns[i:i + 2] for i in range(0, len(btns), 2)]
-        kb.append([Btn(t(uid, "b_back"), callback_data="menu")])
-        await show(update, t(uid, "months_title"), Markup(kb))
 
     elif data == "search":
         ud["state"] = "search"
@@ -1212,29 +1240,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         ud["state"] = "gen_label"
         await show(update, t(uid, "gen_ask"), back_kb(uid, "vault"))
-
-    elif data == "export":
-        kb = Markup([
-            [Btn(t(uid, "exp_texts"), callback_data="exp_texts")],
-            [Btn(t(uid, "exp_pass"), callback_data="exp_pass")],
-            [Btn(t(uid, "b_back"), callback_data="menu")],
-        ])
-        await show(update, t(uid, "exp_title"), kb)
-
-    elif data in ("exp_texts", "exp_pass"):
-        kind = "text" if data == "exp_texts" else "pass"
-        if kind == "pass" and uid not in vault_open:
-            await q.message.reply_text(t(uid, "vault_first"))
-            return
-        rows = run("SELECT * FROM items WHERE kind=? AND deleted=0 ORDER BY id", (kind,))
-        if not rows:
-            await show(update, t(uid, "exp_none"), back_kb(uid, "export"))
-            return
-        body = "\n\n".join(f"[{r['created']}] {dec(r['content'])}" for r in rows)
-        buf = io.BytesIO(body.encode("utf-8"))
-        await context.bot.send_document(chat_id=q.message.chat_id, document=buf,
-                                        filename=("matnlar.txt" if kind == "text" else "parollar.txt"),
-                                        protect_content=True)
 
     elif data == "backup":
         ok = await backup(context.bot, force=True)
