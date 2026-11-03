@@ -1327,7 +1327,8 @@ def main():
     import web
     web.start(globals())
     import daftar
-    daftar.start(globals())
+    daftar.setup(globals())
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build().post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
