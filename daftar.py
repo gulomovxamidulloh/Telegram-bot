@@ -802,8 +802,7 @@ async def handle_mode(update, context, mode, orig_message):
           (uid, enc(p[0]), enc(p[1]), enc(p[2]), G["now"]()))
         ud.pop("dmode", None)
         await msg.reply_text(f"✅ Saqlandi: {p[0]} · {p[1]}", reply_markup=KB([[B("📇 Daftar", "pb:menu")]]))
-￼Enter file contents here
-import os, re, time, random, shutil, zipfile, tempfile, logging
+import  os, re, time, random, shutil, zipfile, tempfile, logging
 from datetime import datetime, timedelta
 
 log = logging.getLogger("daftar")
